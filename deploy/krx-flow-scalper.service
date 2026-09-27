@@ -1,0 +1,25 @@
+[Unit]
+Description=KRX flow scalper (real quotes, virtual fills only, no orders)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=krxflow
+Group=krxflow
+WorkingDirectory=/opt/krx-flow-scalper
+ExecStart=/bin/bash /opt/krx-flow-scalper/deploy/run.sh
+Restart=always
+RestartSec=10
+Environment=TZ=Asia/Seoul
+# 기존 모의투자 봇이 우선: 메모리 상한·낮은 CPU 우선순위
+MemoryMax=250M
+Nice=5
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/opt/krx-flow-scalper/state /opt/krx-flow-scalper/data /opt/krx-flow-scalper/logs
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
