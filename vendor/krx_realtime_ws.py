@@ -301,7 +301,8 @@ class KISRealtimeWS:
         self.thread = None
         self.connected = threading.Event()
         self.last_message_at = 0.0   # PINGPONG 포함 모든 메시지
-        self.last_data_at = 0.0      # 시세 데이터(0|, 1|)만 — 워치독 기준
+        self.last_data_at = 0.0      # 시세 데이터(0|, 1|)만 — 워치독 기준 (재연결 때 유예로 다시 설정됨)
+        self.last_tick_at = 0.0      # 실제 시세를 마지막으로 받은 시각. 재연결로 초기화하지 않음 — 시세 공백 경고 기준
         self._raw_fp = None
         self._raw_flushed_at = 0.0
 
@@ -380,7 +381,7 @@ class KISRealtimeWS:
         if not message:
             return
         if message[:2] in ("0|", "1|"):
-            self.last_data_at = time.time()
+            self.last_data_at = self.last_tick_at = time.time()
             try:
                 self._raw_log(message)
             except Exception as e:                # 진단 기록 실패가 수신을 막으면 안 됨
