@@ -31,6 +31,29 @@ FORCE_HMS = "152000"
 CAND_MIN_CHG = 3.0            # 후보·감시 유지 기준
 MIN_CAP = 100_000_000_000     # 시총 1000억
 FLOW_KEYS = ("프로그램5분", "프로그램누적", "체결강도")
+DATA_GAP_ALERT_SEC = 180      # 시세가 이만큼 끊기면 텔레그램 경고 (추격봇과 같은 규칙, 2026-09-28)
+
+
+def data_gap_alert(gap_state, last_tick_at, now_ts, hms):
+    """시세 공백 경고. 보낼 메시지(없으면 None)를 돌려주고 gap_state 를 갱신한다(추격봇 data_gap_alert 와 같은 규칙).
+    - 09:00~15:20 사이, 마지막 시세 이후 DATA_GAP_ALERT_SEC 가 지나면 한 번 경고, 시세가 다시 오면 복구 알림.
+    - last_tick_at: 실제 시세를 마지막으로 받은 시각(재연결로 초기화되지 않는 값), 0 이면 아직 없음.
+    - gap_state: 처음엔 빈 dict. 처음 부른 시각이 기준 시작점이 되므로 09:00 이후에만 부른다(개장 전 무체결을 공백으로 세지 않게).
+    """
+    gap_state.setdefault("since", now_ts)
+    ref = max(last_tick_at or 0, gap_state["since"])
+    gap = now_ts - ref
+    if gap_state.get("alerted"):
+        if last_tick_at and last_tick_at > gap_state["alerted_at"]:
+            gap_state["alerted"] = False
+            return (f"[시세 복구] 실시간 시세가 다시 들어옵니다 "
+                    f"(끊긴 시간 약 {(last_tick_at - gap_state['last_before']) / 60:.0f}분).")
+        return None
+    if not ("090000" <= hms < FORCE_HMS) or gap < DATA_GAP_ALERT_SEC:
+        return None
+    gap_state.update(alerted=True, alerted_at=now_ts, last_before=ref)
+    return (f"[경고] 실시간 시세가 {gap / 60:.0f}분째 들어오지 않습니다(수급봇). 보유 종목 추적손절이 멈춘 상태일 수 있습니다.\n"
+            f"웹소켓은 자동 재연결을 시도 중입니다.")
 
 
 def evaluate(m):

@@ -333,5 +333,52 @@ class TestFlowWS(unittest.TestCase):
         self.assertEqual([t["MKSC_SHRN_ISCD"] for t in self.ticks], ["005930", "000660"])
 
 
+class TestDataGapAlert(unittest.TestCase):
+    """시세 3분 끊김 경고 — 추격봇과 같은 규칙(2026-09-28)."""
+    T0 = 1_000_000.0
+
+    def test_alert_once_then_recover(self):
+        g = {}
+        self.assertIsNone(F.data_gap_alert(g, 0.0, self.T0, "090000"))
+        self.assertIsNone(F.data_gap_alert(g, self.T0, self.T0 + 170, "090250"))
+        m = F.data_gap_alert(g, self.T0, self.T0 + 181, "090301")
+        self.assertIn("3분", m)
+        self.assertIsNone(F.data_gap_alert(g, self.T0, self.T0 + 900, "091500"))      # 한 번만
+        r = F.data_gap_alert(g, self.T0 + 3000, self.T0 + 3001, "095000")
+        self.assertIn("복구", r)
+        self.assertIn("50분", r)
+
+    def test_no_data_since_first_call(self):
+        g = {}
+        F.data_gap_alert(g, 0.0, self.T0, "090000")         # 09:00 첫 호출이 기준 시작점
+        self.assertIsNotNone(F.data_gap_alert(g, 0.0, self.T0 + 200, "090320"))
+
+    def test_closing_auction_excluded(self):
+        g = {}
+        F.data_gap_alert(g, self.T0, self.T0, "152100")
+        self.assertIsNone(F.data_gap_alert(g, self.T0, self.T0 + 500, "152900"))
+
+    def test_reconnect_keeps_last_tick(self):
+        ws = S.FlowWS("k", "s", S.RealtimeBook(), lambda r: None, lambda r: None)
+        rec = ["005930"] + ["0"] * (len(S.PRICE_FIELDS) - 1)
+        ws._on_message(_Sock(), "0|H0STCNT0|001|" + "^".join(rec))
+        t = ws.last_tick_at
+        orig = S.get_approval_key
+        S.get_approval_key = lambda *a, **k: "ak"
+        try:
+            time.sleep(0.01)
+            ws._on_open(_Sock())
+        finally:
+            S.get_approval_key = orig
+        self.assertGreater(t, 0)
+        self.assertEqual(ws.last_tick_at, t)          # 재연결이 공백 경고 기준을 지우지 않음
+        self.assertGreater(ws.last_data_at, t)        # 워치독 유예는 따로 갱신
+
+    def test_pingpong_is_not_tick(self):
+        ws = S.FlowWS("k", "s", S.RealtimeBook(), lambda r: None, lambda r: None)
+        ws._on_message(_Sock(), '{"header":{"tr_id":"PINGPONG"}}')
+        self.assertEqual(ws.last_tick_at, 0.0)
+
+
 if __name__ == "__main__":
     unittest.main()

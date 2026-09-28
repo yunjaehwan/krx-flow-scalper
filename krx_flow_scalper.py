@@ -239,7 +239,8 @@ class FlowWS(KISRealtimeWS):
         if not message:
             return
         if message[:2] in ("0|", "1|"):
-            self.last_data_at = time.time()   # 워치독은 시세만 센다(PINGPONG 제외)
+            # 워치독은 시세만 센다(PINGPONG 제외). last_tick_at 은 재연결로 초기화되지 않는 시세 공백 경고 기준
+            self.last_data_at = self.last_tick_at = time.time()
         if message.startswith("0|"):
             parts = message.split("|", 3)
             if len(parts) < 4:
@@ -855,11 +856,16 @@ class Bot:
             self.st["start_sent"] = self.day
         log(f"[시작] 가상 자산 {eq:,.0f}원, 이월 보유 {list(self.acct.positions)}")
         last_save = last_eval = 0.0
+        gap_state = {}   # 시세 공백 경고 상태 (F.data_gap_alert)
         try:
             while True:
                 hms = hms_now()
                 if hms >= "153030":
                     break
+                if hms >= "090000":
+                    gap_msg = F.data_gap_alert(gap_state, self.ws.last_tick_at, time.time(), hms)
+                    if gap_msg:
+                        log(gap_msg); telegram(gap_msg)
                 if not self.ws.connected.is_set():
                     time.sleep(1)
                     continue
