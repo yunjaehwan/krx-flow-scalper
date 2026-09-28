@@ -33,7 +33,8 @@ except ImportError:
 KST = timezone(timedelta(hours=9))
 MOCK_WS_URL = "ws://ops.koreainvestment.com:31000"
 REAL_WS_URL = "ws://ops.koreainvestment.com:21000"
-WS_STALE_TIMEOUT_SEC = 60  # 이 시간 동안 구독 종목 전체에서 메시지가 한 건도 없으면 "좀비 연결"로 보고 강제 재연결
+WS_STALE_TIMEOUT_SEC = 60  # 이 시간 동안 구독 종목 전체에서 시세 데이터가 한 건도 없으면 "좀비 연결"로 보고 강제 재연결
+# (서버 PINGPONG·구독 응답은 세지 않음: 2026-09-28 구독 없이 PINGPONG만 오는 연결을 45분간 못 잡았음)
 
 TRADE_TR_ID = "H0UNCNT0"  # KRX+NXT 통합 실시간 체결
 
@@ -52,6 +53,19 @@ PRICE_FIELDS = [
     "PRDY_SMNS_HOUR_ACML_VOL", "PRDY_SMNS_HOUR_ACML_VOL_RATE",
     "HOUR_CLS_CODE", "MRKT_TRTM_CLS_CODE", "VI_STND_PRC",
 ]
+
+
+def split_records(values, count, n_fields):
+    """'^'로 나눈 값 목록을 레코드 단위로 자른다. 레코드 길이는 (값 개수 ÷ 레코드 수)로 정한다.
+    2026-09-28 모의 서버 H0UNCNT0 레코드는 문서(46개)보다 1개 많은 47개였고, 46개씩 자르면
+    두 번째 레코드부터 한 칸씩 밀려 쓰레기 종목코드가 됐다. 나누어떨어지지 않거나 레코드 수 칸이
+    이상하면 n_fields 로 자른다. 앞의 n_fields 개만 이름이 붙고 추가 필드는 버려진다."""
+    if count > 0 and len(values) % count == 0 and len(values) // count >= n_fields:
+        stride = len(values) // count
+    else:
+        stride = n_fields
+        count = len(values) // stride if count <= 0 else min(count, len(values) // stride)
+    return [values[i * stride:(i + 1) * stride] for i in range(count)]
 
 
 EXTRA_TICK_FIELDS = ("trade_time", "trade_side_code", "strength", "cum_sell_volume", "cum_buy_volume",
@@ -286,7 +300,8 @@ class KISRealtimeWS:
         self.ws = None
         self.thread = None
         self.connected = threading.Event()
-        self.last_message_at = 0.0
+        self.last_message_at = 0.0   # PINGPONG 포함 모든 메시지
+        self.last_data_at = 0.0      # 시세 데이터(0|, 1|)만 — 워치독 기준
         self._raw_fp = None
         self._raw_flushed_at = 0.0
 
@@ -304,7 +319,21 @@ class KISRealtimeWS:
 
     def _on_open(self, ws):
         self.connected.set()
-        self.last_message_at = time.time()  # 재연결 직후 첫 틱이 아직 안 왔을 때 바로 stale 판정 나는 것 방지(유예)
+        # 재연결 직후 첫 틱이 아직 안 왔을 때 바로 stale 판정 나는 것 방지(유예)
+        self.last_message_at = self.last_data_at = time.time()
+        try:
+            self._subscribe_all(ws)
+        except Exception as e:
+            # 예전에는 여기서 예외가 나면 구독 없이 연결만 살아있는 상태로 남았다(2026-09-28 승인키
+            # 발급 timeout). 소켓을 닫아 _run()의 재연결 루프가 백오프 후 처음부터 다시 하게 한다.
+            print(f"[WS] 구독 실패 → 소켓을 닫고 재연결합니다: {e}")
+            self.connected.clear()
+            try:
+                ws.close()
+            except Exception:
+                pass
+
+    def _subscribe_all(self, ws):
         approval = get_approval_key(self.app_key, self.app_secret, self.is_mock)
         for code in sorted(self.stock_codes):
             ws.send(self._message(TRADE_TR_ID, code, "1", approval))
@@ -319,16 +348,14 @@ class KISRealtimeWS:
         if len(parts) < 4 or parts[1] != TRADE_TR_ID:
             return 0
         values = parts[3].split("^")
-        n_fields = len(PRICE_FIELDS)
         try:
             count = int(parts[2])
         except ValueError:
-            count = len(values) // n_fields
-        count = min(count, len(values) // n_fields)
-        for i in range(count):
-            row = dict(zip(PRICE_FIELDS, values[i * n_fields:(i + 1) * n_fields]))
-            self.book.update_trade(row)
-        return count
+            count = 0
+        records = split_records(values, count, len(PRICE_FIELDS))
+        for rec in records:
+            self.book.update_trade(dict(zip(PRICE_FIELDS, rec)))
+        return len(records)
 
     def _raw_log(self, message):
         """RAW_LOG_START~RAW_LOG_END(KST) 동안 받은 실시간 데이터 메시지를 원본 그대로 저장(진단용).
@@ -353,6 +380,7 @@ class KISRealtimeWS:
         if not message:
             return
         if message[:2] in ("0|", "1|"):
+            self.last_data_at = time.time()
             try:
                 self._raw_log(message)
             except Exception as e:                # 진단 기록 실패가 수신을 막으면 안 됨
@@ -382,9 +410,9 @@ class KISRealtimeWS:
         print(f"[WS] 종료: {code} {msg}")
 
     def is_stale(self):
-        """WS_STALE_TIMEOUT_SEC 동안 구독 종목 전체에서 메시지가 한 건도 없었는지
-        (TCP는 살아있지만 데이터가 안 오는 '좀비 연결')."""
-        return self.last_message_at > 0 and time.time() - self.last_message_at > WS_STALE_TIMEOUT_SEC
+        """WS_STALE_TIMEOUT_SEC 동안 구독 종목 전체에서 시세 데이터가 한 건도 없었는지
+        (TCP는 살아있고 PINGPONG도 오지만 데이터가 안 오는 '좀비 연결')."""
+        return self.last_data_at > 0 and time.time() - self.last_data_at > WS_STALE_TIMEOUT_SEC
 
     def force_reconnect(self):
         """현재 소켓만 닫는다(running은 유지) -> _run()의 기존 재연결 루프가

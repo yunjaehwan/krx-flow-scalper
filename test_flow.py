@@ -276,5 +276,62 @@ class TestBot(unittest.TestCase):
         self.assertEqual(self.b.st["pending_sims"][0]["code"], "B")
 
 
+class _Sock:
+    def __init__(self):
+        self.sent, self.closed = [], False
+    def send(self, m):
+        self.sent.append(m)
+    def close(self):
+        self.closed = True
+
+
+class TestFlowWS(unittest.TestCase):
+    """2026-09-28 추격봇 장애(재연결 때 승인키 timeout → 구독 없는 연결, PINGPONG 때문에 워치독 미동작)와
+    같은 코드를 쓰므로 수급봇에서도 확인한다."""
+
+    def setUp(self):
+        self.ticks, self.idx = [], []
+        self.ws = S.FlowWS("k", "s", S.RealtimeBook(), self.ticks.append, self.idx.append)
+        self.orig = S.get_approval_key
+
+    def tearDown(self):
+        S.get_approval_key = self.orig
+
+    def test_approval_failure_closes_socket(self):
+        def boom(*a, **k):
+            raise TimeoutError("Read timed out")
+        S.get_approval_key = boom
+        sock = _Sock()
+        self.ws._on_open(sock)
+        self.assertTrue(sock.closed)
+        self.assertFalse(self.ws.connected.is_set())
+
+    def test_open_subscribes(self):
+        S.get_approval_key = lambda *a, **k: "ak"
+        self.ws.stock_codes.add("005930")
+        sock = _Sock()
+        self.ws._on_open(sock)
+        self.assertFalse(sock.closed)
+        self.assertEqual(len(sock.sent), len(S.INDEX_CODES) + 1)
+
+    def test_pingpong_does_not_reset_watchdog(self):
+        self.ws.last_data_at = time.time() - S.WS_STALE_TIMEOUT_SEC - 5
+        self.ws._on_message(_Sock(), '{"header":{"tr_id":"PINGPONG"}}')
+        self.assertTrue(self.ws.is_stale())
+        rec = ["005930"] + ["0"] * (len(S.PRICE_FIELDS) - 1)
+        self.ws._on_message(_Sock(), "0|H0STCNT0|001|" + "^".join(rec))
+        self.assertFalse(self.ws.is_stale())
+
+    def test_multi_record_with_extra_field(self):
+        recs = [[c] + ["0"] * (len(S.PRICE_FIELDS) - 1) + ["X"] for c in ("005930", "000660", "035420")]
+        self.ws._on_message(_Sock(), "0|H0STCNT0|003|" + "^".join("^".join(r) for r in recs))
+        self.assertEqual([t["MKSC_SHRN_ISCD"] for t in self.ticks], ["005930", "000660", "035420"])
+
+    def test_multi_record_documented_length(self):
+        recs = [[c] + ["0"] * (len(S.PRICE_FIELDS) - 1) for c in ("005930", "000660")]
+        self.ws._on_message(_Sock(), "0|H0STCNT0|002|" + "^".join("^".join(r) for r in recs))
+        self.assertEqual([t["MKSC_SHRN_ISCD"] for t in self.ticks], ["005930", "000660"])
+
+
 if __name__ == "__main__":
     unittest.main()

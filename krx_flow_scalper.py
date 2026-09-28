@@ -37,7 +37,7 @@ BASE_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(BASE_DIR / "vendor"))
 import krx_common as C                                   # noqa: E402  (기존 봇 함수 복사본)
 from krx_realtime_ws import (KISRealtimeWS, RealtimeBook, PRICE_FIELDS,   # noqa: E402
-                             WS_STALE_TIMEOUT_SEC, get_approval_key)
+                             WS_STALE_TIMEOUT_SEC, get_approval_key, split_records)
 import flow_core as F                                    # noqa: E402
 
 REAL_BASE = "https://openapi.koreainvestment.com:9443"
@@ -205,9 +205,8 @@ class FlowWS(KISRealtimeWS):
             log(f"[WS] 전송 실패 {tr} {key}: {e}")
             return False
 
-    def _on_open(self, ws):
-        self.connected.set()
-        self.last_message_at = time.time()
+    def _subscribe_all(self, ws):
+        # 부모 _on_open 이 connected·유예 시각을 정하고, 여기서 예외가 나면 소켓을 닫아 재연결한다
         self.approval = get_approval_key(self.app_key, self.app_secret, False)
         for code in INDEX_CODES.values():
             ws.send(self._message("H0UPCNT0", code, "1", self.approval)); time.sleep(0.05)
@@ -239,6 +238,8 @@ class FlowWS(KISRealtimeWS):
         self.last_message_at = time.time()
         if not message:
             return
+        if message[:2] in ("0|", "1|"):
+            self.last_data_at = time.time()   # 워치독은 시세만 센다(PINGPONG 제외)
         if message.startswith("0|"):
             parts = message.split("|", 3)
             if len(parts) < 4:
@@ -247,19 +248,18 @@ class FlowWS(KISRealtimeWS):
             try:
                 cnt = int(parts[2])
             except ValueError:
-                cnt = 1
+                cnt = 0
             if tr == "H0STCNT0":
-                n = len(PRICE_FIELDS)
-                for i in range(min(cnt, len(vals) // n)):
-                    row = dict(zip(PRICE_FIELDS, vals[i * n:(i + 1) * n]))
+                for rec in split_records(vals, cnt, len(PRICE_FIELDS)):
+                    row = dict(zip(PRICE_FIELDS, rec))
                     self.book.update_trade(row)
                     try:
                         self.on_tick(row)
                     except Exception as e:
                         log(f"[틱 처리 오류] {e}")
             elif tr == "H0UPCNT0":
-                for i in range(min(cnt, len(vals) // INDEX_NFIELDS)):
-                    row = dict(zip(INDEX_FIELDS, vals[i * INDEX_NFIELDS:i * INDEX_NFIELDS + len(INDEX_FIELDS)]))
+                for rec in split_records(vals, cnt, INDEX_NFIELDS):
+                    row = dict(zip(INDEX_FIELDS, rec))
                     try:
                         self.on_index(row)
                     except Exception as e:
@@ -863,7 +863,8 @@ class Bot:
                 if not self.ws.connected.is_set():
                     time.sleep(1)
                     continue
-                if self.ws.is_stale() and "090000" <= hms <= "153000":
+                # 15:20~15:30 동시호가에는 체결이 없어 시세 기준 워치독이 헛돌므로 그 전까지만 본다
+                if self.ws.is_stale() and "090000" <= hms < "152000":
                     msg = f"웹소켓 {WS_STALE_TIMEOUT_SEC}초 무수신 — 강제 재연결"
                     log(msg); telegram(msg)
                     self.ws.force_reconnect()
